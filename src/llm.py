@@ -4,7 +4,7 @@ import json
 import os
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -201,6 +201,14 @@ your knowledge — no need to fetch data.
 - If the user says hello or makes small talk, respond naturally.
 - Only fetch data when the user is asking about specific data, trends, or numbers.
 
+## Handling unclear or nonsensical input
+- If the user sends gibberish, random characters, or a very vague message that does not \
+relate to economics, do NOT call any tools. Instead, respond politely and suggest topics \
+you can help with, such as: inflation, GDP, unemployment, interest rates, stock market, \
+housing, retail sales, or trade data.
+- If you are unsure what the user is asking for, ask a clarifying question instead of \
+guessing.
+
 ## Conversation style
 - Be concise but informative.
 - Use plain English, avoid jargon unless the user is clearly technical.
@@ -244,6 +252,19 @@ def run_agent(
     -------
     (response_text, updated_chat_history)
     """
+    # Guard against empty / whitespace-only input
+    if not user_input or not user_input.strip():
+        fallback = (
+            "It looks like you sent an empty message. Try asking about economic data — "
+            "for example, \"Show me inflation over the last 5 years\" or "
+            "\"What is the current unemployment rate?\""
+        )
+        updated = chat_history + [
+            HumanMessage(content=user_input or ""),
+            AIMessage(content=fallback),
+        ]
+        return fallback, updated
+
     if agent is None:
         agent = create_agent_executor()
 
@@ -262,7 +283,6 @@ def run_agent(
         for tc in response.tool_calls:
             tool_fn = {t.name: t for t in TOOLS}.get(tc["name"])
             if tool_fn is None:
-                from langchain_core.messages import ToolMessage
                 messages.append(
                     ToolMessage(content=f"Unknown tool: {tc['name']}", tool_call_id=tc["id"])
                 )
@@ -273,11 +293,18 @@ def run_agent(
             except Exception as e:
                 result = f"Tool error: {e}"
 
-            from langchain_core.messages import ToolMessage
             messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
     # Extract final response
     final_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    # Guard against empty final response
+    if not final_text or not final_text.strip():
+        final_text = (
+            "I wasn't able to generate a response for that. Could you try rephrasing "
+            "your question? For example, you can ask about inflation, GDP, unemployment, "
+            "or other economic indicators."
+        )
 
     # Update history (skip the system message)
     updated_history = chat_history + [

@@ -3,6 +3,25 @@
 import pandas as pd
 import plotly.graph_objects as go
 
+# Distinct color palette for chart traces
+COLORS = [
+    "#2563EB",  # blue
+    "#DC2626",  # red
+    "#16A34A",  # green
+    "#D97706",  # amber
+    "#9333EA",  # purple
+    "#0891B2",  # cyan
+]
+
+_LAYOUT_DEFAULTS = dict(
+    template="plotly_white",
+    hovermode="x unified",
+    height=450,
+    margin=dict(l=60, r=30, t=50, b=50),
+    font=dict(size=13),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+)
+
 
 def line_chart(
     df: pd.DataFrame,
@@ -22,16 +41,17 @@ def line_chart(
     fig = go.Figure()
     cols = series_columns or [c for c in df.columns if c != "date"]
 
-    for col in cols:
-        fig.add_trace(go.Scatter(x=df["date"], y=df[col], mode="lines", name=col))
+    for i, col in enumerate(cols):
+        fig.add_trace(go.Scatter(
+            x=df["date"], y=df[col], mode="lines", name=col,
+            line=dict(color=COLORS[i % len(COLORS)]),
+        ))
 
     fig.update_layout(
         title=title,
         xaxis_title="Date",
         yaxis_title=y_label,
-        template="plotly_white",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        **_LAYOUT_DEFAULTS,
     )
     return fig
 
@@ -46,16 +66,18 @@ def bar_chart(
     fig = go.Figure()
     cols = series_columns or [c for c in df.columns if c != "date"]
 
-    for col in cols:
-        fig.add_trace(go.Bar(x=df["date"], y=df[col], name=col))
+    for i, col in enumerate(cols):
+        fig.add_trace(go.Bar(
+            x=df["date"], y=df[col], name=col,
+            marker_color=COLORS[i % len(COLORS)],
+        ))
 
     fig.update_layout(
         title=title,
         xaxis_title="Date",
         yaxis_title=y_label,
-        template="plotly_white",
         barmode="group",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        **_LAYOUT_DEFAULTS,
     )
     return fig
 

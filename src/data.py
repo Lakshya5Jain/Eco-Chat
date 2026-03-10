@@ -12,6 +12,14 @@ load_dotenv(override=True)
 
 _fred: Fred | None = None
 
+# Streamlit caching (graceful fallback if streamlit is not available)
+try:
+    import streamlit as st
+    _cache_data = st.cache_data(ttl=300)
+except Exception:
+    def _cache_data(fn):
+        return fn
+
 
 def _get_fred() -> Fred:
     """Lazy-init the FRED client."""
@@ -22,6 +30,16 @@ def _get_fred() -> Fred:
             raise RuntimeError("FRED_API_KEY is not set in .env")
         _fred = Fred(api_key=api_key)
     return _fred
+
+
+def _parse_date(value: str | None) -> datetime | None:
+    """Safely parse an ISO date string, returning None on failure."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +73,7 @@ COMMON_SERIES = {
 }
 
 
+@_cache_data
 def search_fred_series(query: str, limit: int = 10) -> str:
     """Search FRED for series matching a query string.
 
@@ -84,6 +103,7 @@ def search_fred_series(query: str, limit: int = 10) -> str:
         return f"Error searching FRED: {e}"
 
 
+@_cache_data
 def fetch_fred_data(
     series_id: str,
     start_date: str | None = None,
@@ -110,10 +130,15 @@ def fetch_fred_data(
     """
     fred = _get_fred()
 
-    # Resolve dates
-    end = datetime.today() if end_date is None else datetime.fromisoformat(end_date)
-    if start_date:
-        start = datetime.fromisoformat(start_date)
+    # Validate years_back
+    if years_back is not None and (not isinstance(years_back, int) or years_back <= 0):
+        years_back = 5
+
+    # Resolve dates with safe parsing
+    end = _parse_date(end_date) or datetime.today()
+    start_parsed = _parse_date(start_date)
+    if start_parsed:
+        start = start_parsed
     elif years_back:
         start = end - timedelta(days=365 * years_back)
     else:

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "econ-chat",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "econ-chat"],
+      "port": 8501
+    }
+  ]
+}
