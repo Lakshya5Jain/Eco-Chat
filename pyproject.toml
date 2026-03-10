@@ -1,0 +1,19 @@
+[project]
+name = "econ-chat"
+version = "0.1.0"
+description = "Economic data chat application powered by FRED API and LangChain"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.45.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-community>=0.3.0",
+    "fredapi>=0.5.2",
+    "pandas>=2.2.0",
+    "plotly>=6.0.0",
+    "python-dotenv>=1.1.0",
+]
+
+[dependency-groups]
+dev = []
