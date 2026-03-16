@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 
 # Distinct color palette for chart traces
 COLORS = [
-    "#2563EB",  # blue
+    "#0032FF",  # Millennium blue
     "#DC2626",  # red
     "#16A34A",  # green
     "#D97706",  # amber
@@ -14,12 +14,18 @@ COLORS = [
 ]
 
 _LAYOUT_DEFAULTS = dict(
-    template="plotly_white",
+    template="plotly_dark",
     hovermode="x unified",
     height=450,
     margin=dict(l=60, r=30, t=50, b=50),
     font=dict(size=13),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(10,10,20,0.5)",
+)
+
+_AXIS_DEFAULTS = dict(
+    gridcolor="rgba(0,50,255,0.1)",
 )
 
 
@@ -53,6 +59,8 @@ def line_chart(
         yaxis_title=y_label,
         **_LAYOUT_DEFAULTS,
     )
+    fig.update_xaxes(**_AXIS_DEFAULTS)
+    fig.update_yaxes(**_AXIS_DEFAULTS)
     return fig
 
 
@@ -79,6 +87,8 @@ def bar_chart(
         barmode="group",
         **_LAYOUT_DEFAULTS,
     )
+    fig.update_xaxes(**_AXIS_DEFAULTS)
+    fig.update_yaxes(**_AXIS_DEFAULTS)
     return fig
 
 
@@ -88,11 +98,7 @@ def multi_series_chart(
     y_label: str = "",
     series_columns: list[str] | None = None,
 ) -> go.Figure:
-    """Create a multi-series comparison line chart.
-
-    Identical to line_chart but named explicitly for the agent to signal
-    'comparison' intent.
-    """
+    """Create a multi-series comparison line chart."""
     return line_chart(df, title=title, y_label=y_label, series_columns=series_columns)
 
 

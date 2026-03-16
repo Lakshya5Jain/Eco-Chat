@@ -1,0 +1,200 @@
+"""Chat page — economic data conversation interface."""
+
+import json
+import logging
+import re
+
+import streamlit as st
+
+from src.charts import create_chart
+from src.data import fetch_fred_data, fetch_multiple_series
+from src.llm import create_agent_executor, run_agent
+from src.styles import BASE_CSS, CHAT_CSS
+
+logger = logging.getLogger(__name__)
+
+EXAMPLE_QUERIES = [
+    "Show me inflation over the last 5 years",
+    "Compare GDP and unemployment",
+    "What is the current unemployment rate?",
+    "Show me a bar chart of retail sales",
+    "How has the federal funds rate changed since 2020?",
+    "What was the highest S&P 500 value last year?",
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers (moved from old app.py)
+# ---------------------------------------------------------------------------
+
+def parse_chart_blocks(text: str) -> tuple[str, list[dict]]:
+    """Extract ```chart ... ``` JSON blocks from the LLM response."""
+    pattern = r"```chart\s*\n(.*?)\n```"
+    charts = []
+    for match in re.finditer(pattern, text, re.DOTALL):
+        try:
+            spec = json.loads(match.group(1))
+            charts.append(spec)
+        except json.JSONDecodeError:
+            pass
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return cleaned, charts
+
+
+def render_chart(spec: dict):
+    """Fetch data and render a Plotly chart from a chart spec."""
+    series_ids = spec.get("series_ids", [])
+    chart_type = spec.get("chart_type", "line")
+    title = spec.get("title", "")
+    years_back = spec.get("years_back", 5)
+    start_date = spec.get("start_date")
+    end_date = spec.get("end_date")
+
+    if not isinstance(years_back, int) or years_back <= 0:
+        years_back = 5
+
+    if not series_ids:
+        st.warning("No series IDs provided for chart.")
+        return
+
+    try:
+        if len(series_ids) == 1:
+            df, meta = fetch_fred_data(
+                series_ids[0],
+                years_back=years_back,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            chart_title = title or meta["title"]
+            y_label = meta.get("units", "")
+            fig = create_chart(df, chart_type=chart_type, title=chart_title, y_label=y_label)
+        else:
+            df, all_meta = fetch_multiple_series(
+                series_ids,
+                years_back=years_back,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            chart_title = title or "Comparison: " + ", ".join(
+                m["title"] for m in all_meta
+            )
+            fig = create_chart(
+                df,
+                chart_type="comparison",
+                title=chart_title,
+                series_columns=series_ids,
+            )
+
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        logger.exception("Chart rendering failed")
+        st.error("Could not render chart. Please try a different query or time range.")
+
+
+# ---------------------------------------------------------------------------
+# Page layout
+# ---------------------------------------------------------------------------
+
+# Inject CSS
+st.markdown(BASE_CSS, unsafe_allow_html=True)
+st.markdown(CHAT_CSS, unsafe_allow_html=True)
+
+# Header bar
+header_left, header_right = st.columns([8, 1])
+with header_left:
+    st.markdown(
+        '<div class="chat-header-title">'
+        '<span class="chat-header-accent">MILLENNIUM</span> Economic Data Chat'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+with header_right:
+    if st.button("Home", key="nav_home"):
+        st.switch_page("src/pages/home.py")
+
+# Sidebar
+with st.sidebar:
+    st.header("Example Queries")
+    st.markdown("Click any example to try it:")
+    for q in EXAMPLE_QUERIES:
+        if st.button(q, key=f"ex_{q}", use_container_width=True):
+            st.session_state["pending_query"] = q
+            st.rerun()
+
+# Session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "agent" not in st.session_state:
+    st.session_state.agent = create_agent_executor()
+
+# Welcome message
+if not st.session_state.messages:
+    with st.chat_message("assistant"):
+        st.markdown(
+            "Welcome! I can help you explore economic data from the Federal Reserve (FRED). "
+            "Try asking about **inflation**, **GDP**, **unemployment**, **interest rates**, "
+            "or any other economic indicator.\n\n"
+            "You can also click an example query in the sidebar to get started."
+        )
+
+# Render previous messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        for chart_spec in msg.get("charts", []):
+            render_chart(chart_spec)
+
+# User input
+prompt = st.chat_input("Ask about economic data...")
+
+# Check for pending query from home page or sidebar
+if "pending_query" in st.session_state:
+    prompt = st.session_state.pop("pending_query")
+
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt, "charts": []})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                response_text, updated_history = run_agent(
+                    prompt,
+                    st.session_state.chat_history,
+                    agent=st.session_state.agent,
+                )
+                st.session_state.chat_history = updated_history
+
+                cleaned_text, chart_specs = parse_chart_blocks(response_text)
+
+                if not cleaned_text or not cleaned_text.strip():
+                    cleaned_text = (
+                        "I wasn't able to generate a response for that. "
+                        "Could you try rephrasing your question?"
+                    )
+
+                st.markdown(cleaned_text)
+                for spec in chart_specs:
+                    render_chart(spec)
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": cleaned_text,
+                    "charts": chart_specs,
+                })
+
+            except Exception:
+                logger.exception("Agent error")
+                error_msg = (
+                    "Sorry, something went wrong while processing your request. "
+                    "Please try again or rephrase your question."
+                )
+                st.error(error_msg)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": error_msg,
+                    "charts": [],
+                })
