@@ -18,6 +18,9 @@ wheels/
 *.swp
 *.swo
 
+# Chat history
+chat_history.json
+
 # OS
 .DS_Store
 Thumbs.db

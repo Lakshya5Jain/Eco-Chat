@@ -53,7 +53,7 @@ HOME_CSS = """
 /* Hero section */
 .hero-container {
     text-align: center;
-    padding: 4rem 1rem 2rem 1rem;
+    padding: 5rem 1rem 2rem 1rem;
 }
 .hero-title {
     font-size: 4rem;
@@ -135,52 +135,67 @@ HOME_CSS = """
     display: inline-block;
 }
 
-/* Example query cards */
-.example-card {
-    background: #0A0A14;
-    border: 1px solid #1a1a2e;
-    border-radius: 10px;
-    padding: 1rem 1.25rem;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    margin-bottom: 0.5rem;
-}
-.example-card:hover {
-    border-color: #0032FF;
-    background: #0d0d1a;
-}
-.example-card p {
-    margin: 0;
-    color: #ccc;
-    font-size: 0.95rem;
+/* Example category label */
+.example-category {
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: #0032FF;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.25rem;
+    text-align: center;
 }
 
-/* CTA button */
-.cta-container {
+/* CTA section */
+.cta-section {
     text-align: center;
-    margin: 2rem 0;
+    margin-top: 3rem;
 }
-.cta-container .stButton > button {
-    background: #0032FF;
-    color: #FFFFFF;
-    border: none;
-    padding: 0.75rem 2.5rem;
-    font-size: 1.1rem;
-    font-weight: 600;
-    border-radius: 8px;
-    letter-spacing: 0.03em;
+.cta-label {
+    font-size: 1.15rem;
+    color: #888;
+    margin-bottom: 0.75rem;
 }
-.cta-container .stButton > button:hover {
-    background: #0028CC;
-    box-shadow: 0 0 24px rgba(0, 50, 255, 0.3);
+@keyframes cta-pulse {
+    0%, 100% { box-shadow: 0 0 24px rgba(0, 50, 255, 0.2); }
+    50% { box-shadow: 0 0 36px rgba(0, 50, 255, 0.35); }
+}
+/* Primary CTA button */
+button[kind="primary"] {
+    background: #0032FF !important;
+    color: #FFFFFF !important;
+    border: none !important;
+    padding: 1.25rem 3rem !important;
+    font-size: 1.5rem !important;
+    font-weight: 700 !important;
+    border-radius: 10px !important;
+    letter-spacing: 0.04em;
+    animation: cta-pulse 3s ease-in-out infinite;
+    transition: all 0.2s ease !important;
+    min-height: 64px !important;
+}
+button[kind="primary"]:hover {
+    background: #0028CC !important;
+    box-shadow: 0 0 40px rgba(0, 50, 255, 0.5) !important;
+    transform: translateY(-2px);
 }
 
 /* Footer */
 .footer {
     text-align: center;
     padding: 2rem 0 1rem 0;
+    border-top: 1px solid #1a1a2e;
+    margin-top: 2rem;
+}
+.footer-attribution {
+    color: #FFFFFF;
+    font-size: 0.95rem;
+    font-weight: 500;
+    margin-bottom: 0.35rem;
+}
+.footer-powered {
     color: #555;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
 }
 
 /* Section headers */
@@ -189,7 +204,7 @@ HOME_CSS = """
     font-size: 1.3rem;
     font-weight: 600;
     color: #FFFFFF;
-    margin: 3rem 0 1.25rem 0;
+    margin: 3.5rem 0 1.5rem 0;
     letter-spacing: 0.02em;
 }
 </style>

@@ -6,12 +6,12 @@ from src.data import COMMON_SERIES
 from src.styles import BASE_CSS, HOME_CSS
 
 EXAMPLE_QUERIES = [
-    "Show me inflation over the last 5 years",
-    "Compare GDP and unemployment",
-    "What is the current unemployment rate?",
-    "Show me a bar chart of retail sales",
-    "How has the federal funds rate changed since 2020?",
-    "What was the highest S&P 500 value last year?",
+    ("Monetary Policy", "How has the Fed Funds rate changed since January 2022?"),
+    ("Inflation Comparison", "Compare CPI and Core PCE inflation over the last 3 years"),
+    ("GDP Analysis", "Show me a bar chart of quarterly GDP growth in 2024"),
+    ("Labor Market", "What's the unemployment rate vs pre-COVID levels?"),
+    ("Multi-Asset", "Plot 10-year Treasury yields vs S&P 500 over the past 5 years"),
+    ("Housing & Sentiment", "Show housing starts and consumer sentiment since 2020"),
 ]
 
 # --- Inject CSS ---
@@ -23,10 +23,11 @@ st.markdown(
     """
     <div class="hero-container">
         <div class="hero-title">ECO-CHAT</div>
-        <div class="hero-subtitle">Economic Data Intelligence</div>
+        <div class="hero-subtitle">Real-Time Economic Data, Explained</div>
         <div class="hero-desc">
-            Ask plain-English questions about economic data and get instant
-            insights with interactive charts — powered by AI and the Federal Reserve.
+            Explore GDP, inflation, employment, interest rates, and more from the
+            Federal Reserve (FRED). Ask questions in plain English and get instant
+            analysis with interactive visualizations.
         </div>
     </div>
     """,
@@ -38,9 +39,9 @@ st.markdown('<div class="section-header">How It Works</div>', unsafe_allow_html=
 
 cols = st.columns(3)
 steps = [
-    ("1", "Ask a Question", "Type any economic question in plain English — no codes or syntax needed."),
-    ("2", "AI Fetches Data", "The agent identifies the right FRED series and pulls real-time data."),
-    ("3", "Get Insights", "Receive a clear explanation and interactive charts in seconds."),
+    ("1", "Ask a Question", "Ask about any macroeconomic indicator \u2014 inflation trends, rate comparisons, labor market data. No FRED codes or special syntax required."),
+    ("2", "AI Fetches Data", "The LangChain agent identifies the right FRED series, selects the appropriate date range, and retrieves the latest available data."),
+    ("3", "Get Insights", "Receive a plain-English analysis with interactive Plotly charts. Ask follow-up questions to refine or compare."),
 ]
 for col, (num, title, desc) in zip(cols, steps):
     with col:
@@ -76,20 +77,30 @@ row1 = st.columns(3)
 row2 = st.columns(3)
 all_cols = row1 + row2
 
-for col, query in zip(all_cols, EXAMPLE_QUERIES):
+for col, (category, query) in zip(all_cols, EXAMPLE_QUERIES):
     with col:
-        if st.button(query, key=f"home_ex_{query}", use_container_width=True):
+        st.markdown(f'<div class="example-category">{category}</div>', unsafe_allow_html=True)
+        if st.button(query, key=f"home_ex_{query}", width="stretch"):
             st.session_state["pending_query"] = query
             st.switch_page("pages/chat.py")
 
 # --- CTA ---
-st.markdown('<div class="cta-container">', unsafe_allow_html=True)
-if st.button("Start Chatting", key="cta_start", use_container_width=False):
-    st.switch_page("pages/chat.py")
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown(
+    '<div class="cta-section"><div class="cta-label">Ready to explore economic data?</div></div>',
+    unsafe_allow_html=True,
+)
+_cta_left, _cta_mid, _cta_right = st.columns([1, 2, 1])
+with _cta_mid:
+    if st.button("Start Chatting \u2192", key="cta_start", width="stretch", type="primary"):
+        st.switch_page("pages/chat.py")
 
 # --- Footer ---
 st.markdown(
-    '<div class="footer">Powered by FRED API &amp; LangChain</div>',
+    """
+    <div class="footer">
+        <div class="footer-attribution">Made for Millennium Saxa Capital Management by Laksh J.</div>
+        <div class="footer-powered">Powered by FRED API &middot; LangChain &middot; Plotly</div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )

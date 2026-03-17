@@ -1,12 +1,15 @@
-"""LLM layer — LangChain agent with FRED data tools."""
+"""LLM layer — LangGraph ReAct agent with FRED data tools."""
 
 import json
+import logging
 import os
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphRecursionError
+from langgraph.prebuilt import create_react_agent
 
 from src.data import (
     fetch_fred_data,
@@ -16,6 +19,67 @@ from src.data import (
 )
 
 load_dotenv(override=True)
+logger = logging.getLogger(__name__)
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Parse int environment variables with a safe fallback."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    """Parse float environment variables with a safe fallback."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _looks_like_timeout(exc: Exception) -> bool:
+    """Best-effort check for timeout-like transport/runtime errors."""
+    text = str(exc).lower()
+    return (
+        "timed out" in text
+        or "timeout" in text
+        or "connection error" in text
+        or "connection reset" in text
+        or "proxyerror" in text
+        or "forbidden" in text
+    )
+
+
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4")
+
+
+def _extract_text(content) -> str:
+    """Extract plain text from an AIMessage content field.
+
+    Reasoning models (o-series, gpt-5.4-pro, etc.) return structured content:
+    [{"type": "reasoning", ...}, {"type": "text", "text": "..."}]
+    This helper normalises that to a plain string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts).strip()
+    return str(content)
+OPENAI_REQUEST_TIMEOUT_SECONDS = _safe_float_env("OPENAI_REQUEST_TIMEOUT_SECONDS", 60.0)
+AGENT_RECURSION_LIMIT = _safe_int_env("AGENT_RECURSION_LIMIT", 8)
 
 # --------------------------------------------------------------------------- #
 # Tools — the LLM decides when to call these                                  #
@@ -160,6 +224,70 @@ def resolve_series(concept: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Chart tool — structured tool calling replaces fragile regex parsing         #
+# --------------------------------------------------------------------------- #
+
+_pending_charts: list[dict] = []
+
+
+@tool
+def generate_chart(
+    series_ids: list[str],
+    chart_type: str = "line",
+    title: str = "",
+    years_back: int = 5,
+    start_date: str = "",
+    end_date: str = "",
+) -> str:
+    """Generate an inline chart for economic data series.
+
+    Call this AFTER fetching data to show a visualization to the user.
+    The chart will appear inline in the chat interface.
+
+    Parameters
+    ----------
+    series_ids : list[str]
+        FRED series IDs to chart (e.g. ["CPIAUCSL"] or ["UNRATE", "FEDFUNDS"]).
+    chart_type : str
+        Type of chart:
+        - "line" — time series trend (default)
+        - "area" — filled line chart, good for cumulative or volume data
+        - "bar" — bar chart, good for periodic comparisons
+        - "comparison" — multi-series with automatic dual y-axes when units differ
+        When charting 2+ series, prefer "comparison" as it auto-detects whether
+        dual y-axes are needed based on the series units.
+    title : str
+        Chart title.
+    years_back : int
+        Years of data to show (default 5).
+    start_date : str
+        Optional ISO date "YYYY-MM-DD" — overrides years_back.
+    end_date : str
+        Optional ISO date "YYYY-MM-DD".
+    """
+    spec = {
+        "series_ids": series_ids,
+        "chart_type": chart_type,
+        "title": title,
+        "years_back": years_back,
+    }
+    if start_date:
+        spec["start_date"] = start_date
+    if end_date:
+        spec["end_date"] = end_date
+
+    _pending_charts.append(spec)
+    return f"Chart queued: {chart_type} chart of {', '.join(series_ids)}"
+
+
+def pop_pending_charts() -> list[dict]:
+    """Return and clear all pending chart specs."""
+    result = list(_pending_charts)
+    _pending_charts.clear()
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Agent setup                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -178,22 +306,18 @@ Economic Data) database.
 - Mention key trends, recent values, historical context, and what the data means.
 
 ## Chart instructions
-When you fetch data and want to show a chart, include a JSON block at the END \
-of your response in this exact format (the UI will parse it):
-
-```chart
-{
-  "action": "chart",
-  "series_ids": ["SERIES_ID"],
-  "chart_type": "line",
-  "title": "Chart Title",
-  "years_back": 5
-}
-```
-
-Chart types: "line", "bar", "comparison" (for multi-series).
-For multi-series comparisons, list all series IDs in the array.
-Only include the chart block when you have actually fetched data.
+After fetching data, call the generate_chart tool to show a visualization. \
+Choose the appropriate chart_type:
+- "line" for single series trends over time
+- "area" for filled charts — good for cumulative measures, money supply, GDP levels
+- "bar" for period-based comparisons, shorter date ranges, or discrete values
+- "comparison" for multi-series — this automatically uses dual y-axes when the \
+series have different units (e.g. unemployment rate % vs GDP in billions), and \
+normalizes to % change when comparing 3+ series with different scales
+Pass the same series_ids and years_back you used when fetching the data. \
+When comparing 2+ series, always use "comparison" as the chart_type. \
+Only call generate_chart when you have actually fetched data — do not chart \
+data you haven't retrieved.
 
 ## When NOT to fetch data
 - If the user asks a general economics question (e.g., "what is GDP?"), just answer from \
@@ -215,7 +339,7 @@ guessing.
 - If something goes wrong with the data fetch, explain the issue and suggest alternatives.
 """
 
-TOOLS = [search_economic_data, get_economic_data, compare_economic_series, resolve_series]
+TOOLS = [search_economic_data, get_economic_data, compare_economic_series, resolve_series, generate_chart]
 
 
 def build_llm():
@@ -223,13 +347,24 @@ def build_llm():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set in .env")
-    return ChatOpenAI(model="gpt-5.4-2026-03-05", temperature=0.3, api_key=api_key)
+    return ChatOpenAI(
+        model=DEFAULT_OPENAI_MODEL,
+        temperature=0.3,
+        api_key=api_key,
+        request_timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
 
 
 def create_agent_executor():
-    """Create a LangChain agent with tools bound."""
+    """Create a LangGraph ReAct agent with tools.
+
+    Uses LangGraph's `create_react_agent` — the modern recommended approach.
+    It implements a ReAct-style loop as a compiled state graph, handling tool
+    dispatch and stopping conditions automatically.
+    """
     llm = build_llm()
-    return llm.bind_tools(TOOLS)
+    return create_react_agent(llm, TOOLS, prompt=SystemMessage(content=SYSTEM_PROMPT))
 
 
 def run_agent(
@@ -268,35 +403,56 @@ def run_agent(
     if agent is None:
         agent = create_agent_executor()
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + chat_history + [HumanMessage(content=user_input)]
+    # Clear any stale pending charts
+    pop_pending_charts()
 
-    # Agentic loop — keep running until the model stops calling tools
-    max_iterations = 10
-    for _ in range(max_iterations):
-        response = agent.invoke(messages)
-        messages.append(response)
+    # Build messages: history + new user message
+    messages = list(chat_history) + [HumanMessage(content=user_input)]
 
-        if not response.tool_calls:
-            break
-
-        # Execute each tool call
-        for tc in response.tool_calls:
-            tool_fn = {t.name: t for t in TOOLS}.get(tc["name"])
-            if tool_fn is None:
-                messages.append(
-                    ToolMessage(content=f"Unknown tool: {tc['name']}", tool_call_id=tc["id"])
+    # Invoke the LangGraph ReAct agent — it handles the full tool-dispatch
+    # cycle (observe → think → act → observe) automatically
+    try:
+        result = agent.invoke(
+            {"messages": messages},
+            config={"recursion_limit": AGENT_RECURSION_LIMIT},
+        )
+    except GraphRecursionError:
+        logger.warning("Agent hit recursion limit for input: %s", user_input)
+        fallback = (
+            "I got stuck while analyzing that request. Please try a simpler or more specific "
+            "question, for example: 'Show CPI inflation over the last 5 years.'"
+        )
+        updated = chat_history + [
+            HumanMessage(content=user_input),
+            AIMessage(content=fallback),
+        ]
+        return fallback, updated
+    except Exception as e:
+        if _looks_like_timeout(e):
+            logger.warning("Agent timed out for input: %s", user_input)
+            # If tools already ran and queued charts, the data was fetched
+            # successfully — only the final text summary timed out.
+            if _pending_charts:
+                fallback = (
+                    "I fetched the data and generated a chart for you (shown below). "
+                    "The detailed text analysis timed out — feel free to ask a "
+                    "follow-up question about what you see in the chart."
                 )
-                continue
+            else:
+                fallback = (
+                    "That request timed out while contacting the model or data source. "
+                    "Please try again, or use a narrower query (single indicator + date range)."
+                )
+            updated = chat_history + [
+                HumanMessage(content=user_input),
+                AIMessage(content=fallback),
+            ]
+            return fallback, updated
+        raise
 
-            try:
-                result = tool_fn.invoke(tc["args"])
-            except Exception as e:
-                result = f"Tool error: {e}"
-
-            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-
-    # Extract final response
-    final_text = response.content if isinstance(response.content, str) else str(response.content)
+    # Extract the final AI response from the agent's message list
+    final_message = result["messages"][-1]
+    final_text = _extract_text(final_message.content)
 
     # Guard against empty final response
     if not final_text or not final_text.strip():
@@ -306,10 +462,75 @@ def run_agent(
             "or other economic indicators."
         )
 
-    # Update history (skip the system message)
+    # Update history with just the user message and final AI response
     updated_history = chat_history + [
         HumanMessage(content=user_input),
         AIMessage(content=final_text),
     ]
 
     return final_text, updated_history
+
+
+def run_agent_stream(
+    user_input: str,
+    chat_history: list,
+    agent=None,
+):
+    """Stream the agent's response, yielding text chunks and status updates.
+
+    Yields
+    ------
+    dict with keys:
+        "type": "text" | "status"
+        "content": str
+    """
+    if not user_input or not user_input.strip():
+        yield {
+            "type": "text",
+            "content": (
+                "It looks like you sent an empty message. Try asking about economic data — "
+                "for example, \"Show me inflation over the last 5 years\" or "
+                "\"What is the current unemployment rate?\""
+            ),
+        }
+        return
+
+    if agent is None:
+        agent = create_agent_executor()
+
+    # Clear any stale pending charts
+    pop_pending_charts()
+
+    messages = list(chat_history) + [HumanMessage(content=user_input)]
+
+    final_text = ""
+
+    for event in agent.stream({"messages": messages}, stream_mode="updates"):
+        for node_name, node_output in event.items():
+            if node_name == "agent":
+                # The agent node produced a response
+                msgs = node_output.get("messages", [])
+                for msg in msgs:
+                    if isinstance(msg, AIMessage):
+                        text = _extract_text(msg.content)
+                        if text and not msg.tool_calls:
+                            # Final text response
+                            final_text = text
+                            yield {"type": "text", "content": text}
+                        elif msg.tool_calls:
+                            # Agent is about to call tools
+                            for tc in msg.tool_calls:
+                                yield {"type": "status", "content": f"Calling {tc['name']}..."}
+            elif node_name == "tools":
+                # Tool execution completed
+                pass
+
+    if not final_text:
+        yield {
+            "type": "text",
+            "content": (
+                "I wasn't able to generate a response for that. Could you try rephrasing "
+                "your question? For example, you can ask about inflation, GDP, unemployment, "
+                "or other economic indicators."
+            ),
+        }

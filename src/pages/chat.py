@@ -1,45 +1,21 @@
 """Chat page — economic data conversation interface."""
 
-import json
 import logging
-import re
 
 import streamlit as st
 
+from src.chat_store import create_chat, delete_chat, derive_title, list_chats, load_chat, save_chat
 from src.charts import create_chart
 from src.data import fetch_fred_data, fetch_multiple_series
-from src.llm import create_agent_executor, run_agent
+from src.llm import create_agent_executor, pop_pending_charts, run_agent
 from src.styles import BASE_CSS, CHAT_CSS
 
 logger = logging.getLogger(__name__)
 
-EXAMPLE_QUERIES = [
-    "Show me inflation over the last 5 years",
-    "Compare GDP and unemployment",
-    "What is the current unemployment rate?",
-    "Show me a bar chart of retail sales",
-    "How has the federal funds rate changed since 2020?",
-    "What was the highest S&P 500 value last year?",
-]
-
 
 # ---------------------------------------------------------------------------
-# Helpers (moved from old app.py)
+# Helpers
 # ---------------------------------------------------------------------------
-
-def parse_chart_blocks(text: str) -> tuple[str, list[dict]]:
-    """Extract ```chart ... ``` JSON blocks from the LLM response."""
-    pattern = r"```chart\s*\n(.*?)\n```"
-    charts = []
-    for match in re.finditer(pattern, text, re.DOTALL):
-        try:
-            spec = json.loads(match.group(1))
-            charts.append(spec)
-        except json.JSONDecodeError:
-            pass
-    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
-    return cleaned, charts
-
 
 def render_chart(spec: dict):
     """Fetch data and render a Plotly chart from a chart spec."""
@@ -67,7 +43,10 @@ def render_chart(spec: dict):
             )
             chart_title = title or meta["title"]
             y_label = meta.get("units", "")
-            fig = create_chart(df, chart_type=chart_type, title=chart_title, y_label=y_label)
+            fig = create_chart(
+                df, chart_type=chart_type, title=chart_title,
+                y_label=y_label, meta_list=[meta],
+            )
         else:
             df, all_meta = fetch_multiple_series(
                 series_ids,
@@ -80,15 +59,46 @@ def render_chart(spec: dict):
             )
             fig = create_chart(
                 df,
-                chart_type="comparison",
+                chart_type=chart_type if chart_type != "line" else "comparison",
                 title=chart_title,
                 series_columns=series_ids,
+                meta_list=all_meta,
             )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception:
         logger.exception("Chart rendering failed")
         st.error("Could not render chart. Please try a different query or time range.")
+
+
+def _switch_chat(chat_id: str) -> None:
+    """Load a saved chat into session state."""
+    data = load_chat(chat_id)
+    if data:
+        st.session_state.active_chat_id = chat_id
+        st.session_state.messages = data.get("messages", [])
+        st.session_state.chat_history = data.get("chat_history", [])
+        # Recreate agent for the new conversation
+        st.session_state.agent = create_agent_executor()
+
+
+def _new_chat() -> None:
+    """Start a fresh chat."""
+    _persist_current_chat()
+    chat_id = create_chat()
+    st.session_state.active_chat_id = chat_id
+    st.session_state.messages = []
+    st.session_state.chat_history = []
+    st.session_state.agent = create_agent_executor()
+
+
+def _persist_current_chat() -> None:
+    """Save the current chat to disk if it has messages."""
+    chat_id = st.session_state.get("active_chat_id")
+    messages = st.session_state.get("messages", [])
+    if chat_id and messages:
+        title = derive_title(messages)
+        save_chat(chat_id, title, messages, st.session_state.get("chat_history", []))
 
 
 # ---------------------------------------------------------------------------
@@ -110,18 +120,12 @@ with header_left:
     )
 with header_right:
     if st.button("Home", key="nav_home"):
-        st.switch_page("src/pages/home.py")
+        _persist_current_chat()
+        st.switch_page("pages/home.py")
 
-# Sidebar
-with st.sidebar:
-    st.header("Example Queries")
-    st.markdown("Click any example to try it:")
-    for q in EXAMPLE_QUERIES:
-        if st.button(q, key=f"ex_{q}", use_container_width=True):
-            st.session_state["pending_query"] = q
-            st.rerun()
-
-# Session state
+# --- Session state init ---
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = create_chat()
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_history" not in st.session_state:
@@ -129,14 +133,44 @@ if "chat_history" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = create_agent_executor()
 
+# --- Sidebar: chat management ---
+with st.sidebar:
+    st.markdown(
+        '<div style="font-size:1.1rem;font-weight:600;color:#fff;margin-bottom:0.75rem;">'
+        "Conversations</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("+ New Chat", key="new_chat", width="stretch"):
+        _new_chat()
+        st.rerun()
+
+    st.markdown("---")
+
+    saved_chats = list_chats()
+    for cid, title, _created in saved_chats:
+        col_btn, col_del = st.columns([5, 1])
+        is_active = cid == st.session_state.get("active_chat_id")
+        with col_btn:
+            label = f"\u25B6 {title}" if is_active else title
+            if st.button(label, key=f"chat_{cid}", width="stretch"):
+                if not is_active:
+                    _persist_current_chat()
+                    _switch_chat(cid)
+                    st.rerun()
+        with col_del:
+            if st.button("x", key=f"del_{cid}"):
+                delete_chat(cid)
+                if is_active:
+                    _new_chat()
+                st.rerun()
+
 # Welcome message
 if not st.session_state.messages:
     with st.chat_message("assistant"):
         st.markdown(
             "Welcome! I can help you explore economic data from the Federal Reserve (FRED). "
             "Try asking about **inflation**, **GDP**, **unemployment**, **interest rates**, "
-            "or any other economic indicator.\n\n"
-            "You can also click an example query in the sidebar to get started."
+            "or any other economic indicator."
         )
 
 # Render previous messages
@@ -149,7 +183,7 @@ for msg in st.session_state.messages:
 # User input
 prompt = st.chat_input("Ask about economic data...")
 
-# Check for pending query from home page or sidebar
+# Check for pending query from home page
 if "pending_query" in st.session_state:
     prompt = st.session_state.pop("pending_query")
 
@@ -159,8 +193,8 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
+        try:
+            with st.spinner("Analyzing your question..."):
                 response_text, updated_history = run_agent(
                     prompt,
                     st.session_state.chat_history,
@@ -168,33 +202,38 @@ if prompt:
                 )
                 st.session_state.chat_history = updated_history
 
-                cleaned_text, chart_specs = parse_chart_blocks(response_text)
+            # Collect charts generated via the structured tool
+            chart_specs = pop_pending_charts()
 
-                if not cleaned_text or not cleaned_text.strip():
-                    cleaned_text = (
-                        "I wasn't able to generate a response for that. "
-                        "Could you try rephrasing your question?"
-                    )
-
-                st.markdown(cleaned_text)
-                for spec in chart_specs:
-                    render_chart(spec)
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": cleaned_text,
-                    "charts": chart_specs,
-                })
-
-            except Exception:
-                logger.exception("Agent error")
-                error_msg = (
-                    "Sorry, something went wrong while processing your request. "
-                    "Please try again or rephrase your question."
+            if not response_text or not response_text.strip():
+                response_text = (
+                    "I wasn't able to generate a response for that. "
+                    "Could you try rephrasing your question?"
                 )
-                st.error(error_msg)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": error_msg,
-                    "charts": [],
-                })
+
+            st.markdown(response_text)
+            for spec in chart_specs:
+                render_chart(spec)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response_text,
+                "charts": chart_specs,
+            })
+
+            # Auto-save after each response
+            _persist_current_chat()
+
+        except Exception as e:
+            logger.exception("Agent error")
+            error_msg = (
+                "Sorry, something went wrong while processing your request. "
+                "Please try again or rephrase your question.\n\n"
+                f"**Debug:** `{type(e).__name__}: {e}`"
+            )
+            st.error(error_msg)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": error_msg,
+                "charts": [],
+            })

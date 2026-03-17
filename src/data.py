@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta
 
 import pandas as pd
+import fredapi.fred as fred_module
 from fredapi import Fred
 
 from dotenv import load_dotenv
@@ -12,13 +13,55 @@ load_dotenv(override=True)
 
 _fred: Fred | None = None
 
-# Streamlit caching (graceful fallback if streamlit is not available)
-try:
-    import streamlit as st
-    _cache_data = st.cache_data(ttl=300)
-except Exception:
-    def _cache_data(fn):
-        return fn
+
+def _safe_float_env(name: str, default: float) -> float:
+    """Parse a float env var, falling back cleanly on bad input."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+_FRED_HTTP_TIMEOUT_SECONDS = _safe_float_env("FRED_HTTP_TIMEOUT_SECONDS", 15.0)
+
+# fredapi uses a module-level urlopen without a timeout by default, which can
+# block indefinitely on bad networks. Patch it once to enforce a socket timeout.
+if not getattr(fred_module, "_eco_chat_timeout_patched", False):
+    _original_fred_urlopen = fred_module.urlopen
+
+    def _urlopen_with_timeout(url, *args, **kwargs):
+        kwargs.setdefault("timeout", _FRED_HTTP_TIMEOUT_SECONDS)
+        return _original_fred_urlopen(url, *args, **kwargs)
+
+    fred_module.urlopen = _urlopen_with_timeout
+    fred_module._eco_chat_timeout_patched = True
+
+# Simple TTL cache — compatible with LangGraph's thread pool (no Streamlit
+# session context required, unlike st.cache_data).
+_cache: dict[str, tuple[float, object]] = {}
+_CACHE_TTL = 300  # seconds
+
+
+def _cached(fn):
+    """Decorator: cache function results by args for _CACHE_TTL seconds."""
+    import time, functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (fn.__name__, args, tuple(sorted(kwargs.items())))
+        key_str = str(key)
+        now = time.time()
+        if key_str in _cache:
+            ts, val = _cache[key_str]
+            if now - ts < _CACHE_TTL:
+                return val
+        result = fn(*args, **kwargs)
+        _cache[key_str] = (now, result)
+        return result
+    return wrapper
 
 
 def _get_fred() -> Fred:
@@ -40,6 +83,18 @@ def _parse_date(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
+
+
+def _looks_like_timeout(exc: Exception) -> bool:
+    """Best-effort check for timeout-like transport errors."""
+    text = str(exc).lower()
+    return (
+        "timed out" in text
+        or "timeout" in text
+        or "connection error" in text
+        or "connection reset" in text
+        or "name resolution" in text
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +128,7 @@ COMMON_SERIES = {
 }
 
 
-@_cache_data
+@_cached
 def search_fred_series(query: str, limit: int = 10) -> str:
     """Search FRED for series matching a query string.
 
@@ -100,10 +155,15 @@ def search_fred_series(query: str, limit: int = 10) -> str:
 
         return f"Top results for '{query}':\n" + "\n".join(lines)
     except Exception as e:
+        if _looks_like_timeout(e):
+            return (
+                "FRED took too long to respond (request timed out). "
+                "Please try again in a moment."
+            )
         return f"Error searching FRED: {e}"
 
 
-@_cache_data
+@_cached
 def fetch_fred_data(
     series_id: str,
     start_date: str | None = None,
@@ -165,6 +225,10 @@ def fetch_fred_data(
     except ValueError as e:
         raise ValueError(f"Bad series ID '{series_id}': {e}") from e
     except Exception as e:
+        if _looks_like_timeout(e):
+            raise RuntimeError(
+                f"FRED request timed out for '{series_id}'. Please try again."
+            ) from e
         raise RuntimeError(f"FRED API error for '{series_id}': {e}") from e
 
     if series is None or series.empty:
