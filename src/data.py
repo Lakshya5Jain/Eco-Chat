@@ -240,6 +240,11 @@ def fetch_fred_data(
     df.columns = ["date", "value"]
     df["date"] = pd.to_datetime(df["date"])
 
+    if df.empty:
+        raise ValueError(
+            f"All values for series '{series_id}' are NaN in the requested date range."
+        )
+
     return df, meta
 
 
@@ -254,6 +259,9 @@ def fetch_multiple_series(
     Returns (df, list_of_meta).  The DataFrame has a 'date' column plus one
     column per series (named by series_id).
     """
+    if not series_ids:
+        raise ValueError("No series IDs provided. Please specify at least one FRED series.")
+
     merged: pd.DataFrame | None = None
     all_meta: list[dict] = []
 

@@ -175,6 +175,9 @@ def compare_economic_series(
 
     Returns a JSON summary of the comparison.
     """
+    if not series_ids:
+        return "Error: No series IDs provided. Please specify at least one FRED series to compare."
+
     try:
         df, all_meta = fetch_multiple_series(series_ids, years_back=years_back)
     except (ValueError, RuntimeError) as e:

@@ -228,8 +228,7 @@ if prompt:
             logger.exception("Agent error")
             error_msg = (
                 "Sorry, something went wrong while processing your request. "
-                "Please try again or rephrase your question.\n\n"
-                f"**Debug:** `{type(e).__name__}: {e}`"
+                "Please try again or rephrase your question."
             )
             st.error(error_msg)
             st.session_state.messages.append({
