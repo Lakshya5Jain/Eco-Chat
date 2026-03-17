@@ -16,45 +16,12 @@ from src.data import (
     fetch_multiple_series,
     resolve_series_id,
     search_fred_series,
+    transform_series,
 )
+from src.utils import looks_like_timeout, safe_float_env, safe_int_env
 
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
-
-
-def _safe_int_env(name: str, default: int) -> int:
-    """Parse int environment variables with a safe fallback."""
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _safe_float_env(name: str, default: float) -> float:
-    """Parse float environment variables with a safe fallback."""
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _looks_like_timeout(exc: Exception) -> bool:
-    """Best-effort check for timeout-like transport/runtime errors."""
-    text = str(exc).lower()
-    return (
-        "timed out" in text
-        or "timeout" in text
-        or "connection error" in text
-        or "connection reset" in text
-        or "proxyerror" in text
-        or "forbidden" in text
-    )
 
 
 DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4")
@@ -78,8 +45,8 @@ def _extract_text(content) -> str:
                 parts.append(block)
         return "\n".join(parts).strip()
     return str(content)
-OPENAI_REQUEST_TIMEOUT_SECONDS = _safe_float_env("OPENAI_REQUEST_TIMEOUT_SECONDS", 60.0)
-AGENT_RECURSION_LIMIT = _safe_int_env("AGENT_RECURSION_LIMIT", 8)
+OPENAI_REQUEST_TIMEOUT_SECONDS = safe_float_env("OPENAI_REQUEST_TIMEOUT_SECONDS", 60.0)
+AGENT_RECURSION_LIMIT = safe_int_env("AGENT_RECURSION_LIMIT", 25)
 
 # --------------------------------------------------------------------------- #
 # Tools — the LLM decides when to call these                                  #
@@ -102,8 +69,9 @@ def get_economic_data(
     years_back: int = 5,
     start_date: str = "",
     end_date: str = "",
+    transform: str = "",
 ) -> str:
-    """Fetch economic data from FRED for a specific series.
+    """Fetch economic data from FRED for a specific series, with optional transformation.
 
     Parameters
     ----------
@@ -116,25 +84,56 @@ def get_economic_data(
         Optional ISO date "YYYY-MM-DD" — overrides years_back if provided.
     end_date : str
         Optional ISO date "YYYY-MM-DD" — defaults to today.
+    transform : str
+        Optional transformation to apply to the raw data. Use this instead of
+        searching for obscure pre-computed FRED series. Options:
+        - "yoy"        — year-over-year percent change (auto-detects frequency)
+        - "pct_change"  — period-over-period percent change
+        - "diff"        — period-over-period difference
+        - "rolling_mean_12" — 12-period moving average (change 12 to any number)
+        - "index_100"   — rebase so first observation = 100
+
+        Examples: to get GDP growth rate, fetch "GDPC1" with transform="yoy".
+        To get month-over-month inflation, fetch "CPIAUCSL" with transform="pct_change".
 
     Returns a JSON summary of the data including metadata and recent values.
     """
     try:
+        # Fetch extra history when transforming so YoY doesn't lose the first year
+        fetch_years = years_back
+        if transform and years_back and not start_date:
+            fetch_years = years_back + 2
         df, meta = fetch_fred_data(
             series_id,
             start_date=start_date or None,
             end_date=end_date or None,
-            years_back=years_back,
+            years_back=fetch_years,
         )
     except (ValueError, RuntimeError) as e:
         return f"Error: {e}"
+
+    # Apply transformation if requested
+    if transform:
+        try:
+            df, meta = transform_series(df, meta, transform)
+        except ValueError as e:
+            return f"Error applying transform: {e}"
+
+        # Trim back to the requested window after transform
+        if years_back and not start_date:
+            from datetime import datetime, timedelta
+            cutoff = datetime.today() - timedelta(days=365 * years_back)
+            df = df[df["date"] >= cutoff].reset_index(drop=True)
+
+    if df.empty:
+        return f"No data after applying transform '{transform}' to {series_id}."
 
     # Build a concise summary for the LLM
     summary = {
         "series_id": meta["series_id"],
         "title": meta["title"],
         "units": meta["units"],
-        "frequency": meta["frequency"],
+        "frequency": meta.get("frequency", ""),
         "observations": len(df),
         "date_range": f"{df['date'].min().date()} to {df['date'].max().date()}",
         "latest_value": float(df["value"].iloc[-1]),
@@ -143,16 +142,19 @@ def get_economic_data(
         "mean_value": round(float(df["value"].mean()), 2),
     }
 
+    if transform:
+        summary["transform_applied"] = transform
+
     # Include a sample of data points (first 3 + last 5) for context
     sample_rows = []
     head = df.head(3)
     tail = df.tail(5)
     for _, row in head.iterrows():
-        sample_rows.append({"date": str(row["date"].date()), "value": float(row["value"])})
+        sample_rows.append({"date": str(row["date"].date()), "value": round(float(row["value"]), 4)})
     if len(df) > 8:
         sample_rows.append({"note": f"... ({len(df) - 8} more rows) ..."})
     for _, row in tail.iterrows():
-        sample_rows.append({"date": str(row["date"].date()), "value": float(row["value"])})
+        sample_rows.append({"date": str(row["date"].date()), "value": round(float(row["value"]), 4)})
 
     summary["sample_data"] = sample_rows
 
@@ -241,6 +243,7 @@ def generate_chart(
     years_back: int = 5,
     start_date: str = "",
     end_date: str = "",
+    transform: str = "",
 ) -> str:
     """Generate an inline chart for economic data series.
 
@@ -267,6 +270,9 @@ def generate_chart(
         Optional ISO date "YYYY-MM-DD" — overrides years_back.
     end_date : str
         Optional ISO date "YYYY-MM-DD".
+    transform : str
+        Optional transformation — must match the transform used when fetching.
+        Options: "yoy", "pct_change", "diff", "rolling_mean_12", "index_100".
     """
     spec = {
         "series_ids": series_ids,
@@ -278,9 +284,13 @@ def generate_chart(
         spec["start_date"] = start_date
     if end_date:
         spec["end_date"] = end_date
+    if transform:
+        spec["transform"] = transform
 
     _pending_charts.append(spec)
-    return f"Chart queued: {chart_type} chart of {', '.join(series_ids)}"
+    return f"Chart queued: {chart_type} chart of {', '.join(series_ids)}" + (
+        f" with transform={transform}" if transform else ""
+    )
 
 
 def pop_pending_charts() -> list[dict]:
@@ -307,6 +317,28 @@ Economic Data) database.
 - For comparisons, use compare_economic_series.
 - ALWAYS explain the data in plain, accessible English — never return raw JSON to the user.
 - Mention key trends, recent values, historical context, and what the data means.
+
+## Transformations — compute derived data from base series
+FRED stores mostly **level data** (e.g. GDPC1 = real GDP in billions). When the user
+asks about growth rates, percent changes, or trends, **do NOT search for obscure
+pre-computed FRED series**. Instead, fetch the well-known base series and use the
+`transform` parameter on get_economic_data:
+
+- "Show me GDP growth" → fetch GDPC1 with transform="yoy"
+- "Month-over-month inflation" → fetch CPIAUCSL with transform="pct_change"
+- "How has the S&P 500 changed over time" → fetch SP500 with transform="index_100"
+- "Smoothed unemployment trend" → fetch UNRATE with transform="rolling_mean_12"
+
+Common base series to transform:
+- GDP growth: GDPC1 + yoy
+- Inflation rate: CPIAUCSL + yoy (or pct_change for MoM)
+- Core inflation: PCEPILFE + yoy
+- Real GDP growth: GDPC1 + yoy
+- Job growth: PAYEMS + diff (monthly change in payrolls)
+- Wage growth: CES0500000003 + yoy
+
+Only search FRED for a pre-computed series if the base-series + transform approach
+doesn't cover what the user needs.
 
 ## Chart instructions
 After fetching data, call the generate_chart tool to show a visualization. \
@@ -431,7 +463,7 @@ def run_agent(
         ]
         return fallback, updated
     except Exception as e:
-        if _looks_like_timeout(e):
+        if looks_like_timeout(e):
             logger.warning("Agent timed out for input: %s", user_input)
             # If tools already ran and queued charts, the data was fetched
             # successfully — only the final text summary timed out.
@@ -474,66 +506,3 @@ def run_agent(
     return final_text, updated_history
 
 
-def run_agent_stream(
-    user_input: str,
-    chat_history: list,
-    agent=None,
-):
-    """Stream the agent's response, yielding text chunks and status updates.
-
-    Yields
-    ------
-    dict with keys:
-        "type": "text" | "status"
-        "content": str
-    """
-    if not user_input or not user_input.strip():
-        yield {
-            "type": "text",
-            "content": (
-                "It looks like you sent an empty message. Try asking about economic data — "
-                "for example, \"Show me inflation over the last 5 years\" or "
-                "\"What is the current unemployment rate?\""
-            ),
-        }
-        return
-
-    if agent is None:
-        agent = create_agent_executor()
-
-    # Clear any stale pending charts
-    pop_pending_charts()
-
-    messages = list(chat_history) + [HumanMessage(content=user_input)]
-
-    final_text = ""
-
-    for event in agent.stream({"messages": messages}, stream_mode="updates"):
-        for node_name, node_output in event.items():
-            if node_name == "agent":
-                # The agent node produced a response
-                msgs = node_output.get("messages", [])
-                for msg in msgs:
-                    if isinstance(msg, AIMessage):
-                        text = _extract_text(msg.content)
-                        if text and not msg.tool_calls:
-                            # Final text response
-                            final_text = text
-                            yield {"type": "text", "content": text}
-                        elif msg.tool_calls:
-                            # Agent is about to call tools
-                            for tc in msg.tool_calls:
-                                yield {"type": "status", "content": f"Calling {tc['name']}..."}
-            elif node_name == "tools":
-                # Tool execution completed
-                pass
-
-    if not final_text:
-        yield {
-            "type": "text",
-            "content": (
-                "I wasn't able to generate a response for that. Could you try rephrasing "
-                "your question? For example, you can ask about inflation, GDP, unemployment, "
-                "or other economic indicators."
-            ),
-        }

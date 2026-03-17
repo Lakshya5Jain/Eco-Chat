@@ -9,23 +9,13 @@ from fredapi import Fred
 
 from dotenv import load_dotenv
 
+from src.utils import looks_like_timeout, safe_float_env
+
 load_dotenv(override=True)
 
 _fred: Fred | None = None
 
-
-def _safe_float_env(name: str, default: float) -> float:
-    """Parse a float env var, falling back cleanly on bad input."""
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-_FRED_HTTP_TIMEOUT_SECONDS = _safe_float_env("FRED_HTTP_TIMEOUT_SECONDS", 15.0)
+_FRED_HTTP_TIMEOUT_SECONDS = safe_float_env("FRED_HTTP_TIMEOUT_SECONDS", 15.0)
 
 # fredapi uses a module-level urlopen without a timeout by default, which can
 # block indefinitely on bad networks. Patch it once to enforce a socket timeout.
@@ -83,18 +73,6 @@ def _parse_date(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
-
-
-def _looks_like_timeout(exc: Exception) -> bool:
-    """Best-effort check for timeout-like transport errors."""
-    text = str(exc).lower()
-    return (
-        "timed out" in text
-        or "timeout" in text
-        or "connection error" in text
-        or "connection reset" in text
-        or "name resolution" in text
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +133,7 @@ def search_fred_series(query: str, limit: int = 10) -> str:
 
         return f"Top results for '{query}':\n" + "\n".join(lines)
     except Exception as e:
-        if _looks_like_timeout(e):
+        if looks_like_timeout(e):
             return (
                 "FRED took too long to respond (request timed out). "
                 "Please try again in a moment."
@@ -225,7 +203,7 @@ def fetch_fred_data(
     except ValueError as e:
         raise ValueError(f"Bad series ID '{series_id}': {e}") from e
     except Exception as e:
-        if _looks_like_timeout(e):
+        if looks_like_timeout(e):
             raise RuntimeError(
                 f"FRED request timed out for '{series_id}'. Please try again."
             ) from e
@@ -246,6 +224,107 @@ def fetch_fred_data(
         )
 
     return df, meta
+
+
+# ---------------------------------------------------------------------------
+# Transformations — compute derived series from raw FRED level data
+# ---------------------------------------------------------------------------
+
+# Maps FRED frequency strings to the number of periods in one year.
+_FREQ_PERIODS: dict[str, int] = {
+    "Quarterly": 4,
+    "Monthly": 12,
+    "Annual": 1,
+    "Semiannual": 2,
+    "Weekly": 52,
+    "Biweekly": 26,
+    "Daily": 252,  # approximate trading days
+}
+
+
+def _infer_periods_per_year(meta: dict) -> int:
+    """Return the number of observations per year for a series."""
+    freq = meta.get("frequency", "")
+    for key, periods in _FREQ_PERIODS.items():
+        if key.lower() in freq.lower():
+            return periods
+    # Fallback: guess from frequency short code
+    short = freq.upper()
+    if short.startswith("Q"):
+        return 4
+    if short.startswith("M"):
+        return 12
+    if short.startswith("A"):
+        return 1
+    return 12  # default to monthly
+
+
+def transform_series(
+    df: pd.DataFrame,
+    meta: dict,
+    transform: str,
+) -> tuple[pd.DataFrame, dict]:
+    """Apply a transformation to a fetched FRED series.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must have columns ["date", "value"].
+    meta : dict
+        Series metadata (used to infer frequency for YoY).
+    transform : str
+        One of:
+        - "yoy"       — year-over-year percent change
+        - "pct_change" — period-over-period percent change
+        - "diff"       — period-over-period difference
+        - "rolling_mean_12" — 12-period moving average
+        - "index_100"  — rebase to 100 at the first observation
+
+    Returns
+    -------
+    (transformed_df, updated_meta) — same shape, updated units/title.
+    """
+    out = df.copy()
+    new_meta = dict(meta)
+    original_title = meta.get("title", meta.get("series_id", ""))
+
+    if transform == "yoy":
+        periods = _infer_periods_per_year(meta)
+        out["value"] = out["value"].pct_change(periods=periods) * 100
+        new_meta["units"] = "Percent Change from Year Ago"
+        new_meta["title"] = f"{original_title} (YoY % Change)"
+
+    elif transform == "pct_change":
+        out["value"] = out["value"].pct_change() * 100
+        new_meta["units"] = "Percent Change"
+        new_meta["title"] = f"{original_title} (% Change)"
+
+    elif transform == "diff":
+        out["value"] = out["value"].diff()
+        new_meta["title"] = f"{original_title} (Period Change)"
+
+    elif transform.startswith("rolling_mean"):
+        # e.g. "rolling_mean_12" → window=12
+        parts = transform.split("_")
+        window = int(parts[-1]) if len(parts) == 3 and parts[-1].isdigit() else 12
+        out["value"] = out["value"].rolling(window=window, min_periods=1).mean()
+        new_meta["title"] = f"{original_title} ({window}-Period Moving Avg)"
+
+    elif transform == "index_100":
+        base = out["value"].iloc[0]
+        if base != 0:
+            out["value"] = (out["value"] / base) * 100
+        new_meta["units"] = "Index (Start = 100)"
+        new_meta["title"] = f"{original_title} (Indexed to 100)"
+
+    else:
+        raise ValueError(
+            f"Unknown transform '{transform}'. "
+            "Use: yoy, pct_change, diff, rolling_mean_12, or index_100."
+        )
+
+    out = out.dropna(subset=["value"]).reset_index(drop=True)
+    return out, new_meta
 
 
 def fetch_multiple_series(

@@ -18,6 +18,9 @@ wheels/
 *.swp
 *.swo
 
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
 # Chat history
 chat_history.json
 

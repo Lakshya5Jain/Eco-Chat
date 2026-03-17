@@ -6,7 +6,7 @@ import streamlit as st
 
 from src.chat_store import create_chat, delete_chat, derive_title, list_chats, load_chat, save_chat
 from src.charts import create_chart
-from src.data import fetch_fred_data, fetch_multiple_series
+from src.data import fetch_fred_data, fetch_multiple_series, transform_series
 from src.llm import create_agent_executor, pop_pending_charts, run_agent
 from src.styles import BASE_CSS, CHAT_CSS
 
@@ -25,9 +25,13 @@ def render_chart(spec: dict):
     years_back = spec.get("years_back", 5)
     start_date = spec.get("start_date")
     end_date = spec.get("end_date")
+    transform = spec.get("transform", "")
 
     if not isinstance(years_back, int) or years_back <= 0:
         years_back = 5
+
+    # Fetch extra history when a transform needs look-back (e.g. YoY)
+    fetch_years = years_back + 2 if transform else years_back
 
     if not series_ids:
         st.warning("No series IDs provided for chart.")
@@ -37,10 +41,17 @@ def render_chart(spec: dict):
         if len(series_ids) == 1:
             df, meta = fetch_fred_data(
                 series_ids[0],
-                years_back=years_back,
+                years_back=fetch_years,
                 start_date=start_date,
                 end_date=end_date,
             )
+            if transform:
+                df, meta = transform_series(df, meta, transform)
+                # Trim to requested window after transform
+                if not start_date:
+                    from datetime import datetime, timedelta
+                    cutoff = datetime.today() - timedelta(days=365 * years_back)
+                    df = df[df["date"] >= cutoff].reset_index(drop=True)
             chart_title = title or meta["title"]
             y_label = meta.get("units", "")
             fig = create_chart(
@@ -50,10 +61,25 @@ def render_chart(spec: dict):
         else:
             df, all_meta = fetch_multiple_series(
                 series_ids,
-                years_back=years_back,
+                years_back=fetch_years,
                 start_date=start_date,
                 end_date=end_date,
             )
+            if transform:
+                import pandas as pd
+                for i, sid in enumerate(series_ids):
+                    col_df = df[["date", sid]].rename(columns={sid: "value"}).dropna()
+                    col_df, all_meta[i] = transform_series(col_df, all_meta[i], transform)
+                    col_df = col_df.rename(columns={"value": sid})
+                    if i == 0:
+                        merged = col_df
+                    else:
+                        merged = pd.merge(merged, col_df, on="date", how="outer")
+                df = merged.sort_values("date").reset_index(drop=True)
+                if not start_date:
+                    from datetime import datetime, timedelta
+                    cutoff = datetime.today() - timedelta(days=365 * years_back)
+                    df = df[df["date"] >= cutoff].reset_index(drop=True)
             chart_title = title or "Comparison: " + ", ".join(
                 m["title"] for m in all_meta
             )
@@ -212,27 +238,22 @@ if prompt:
                 )
 
             st.markdown(response_text)
-            for spec in chart_specs:
-                render_chart(spec)
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": response_text,
-                "charts": chart_specs,
-            })
-
-            # Auto-save after each response
-            _persist_current_chat()
 
         except Exception as e:
             logger.exception("Agent error")
-            error_msg = (
+            response_text = (
                 "Sorry, something went wrong while processing your request. "
                 "Please try again or rephrase your question."
             )
-            st.error(error_msg)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": error_msg,
-                "charts": [],
-            })
+            chart_specs = []
+            st.error(response_text)
+
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": response_text,
+        "charts": chart_specs,
+    })
+    _persist_current_chat()
+    # Rerun so the history loop renders charts inside the correct assistant
+    # message bubble — avoids charts visually attaching to the next user message.
+    st.rerun()
